@@ -207,7 +207,7 @@ func createProposal(ctx context.Context, client *storage.Client, s *discordgo.Se
 
 	for _, cocktail := range cocktails {
 		if normalizeName(cocktail) == normalizeName(name.StringValue()) {
-			respond(s, i.Interaction, fmt.Sprintf("%s already exists, maybe try adding a variation?", name), nil, true)
+			respond(s, i.Interaction, fmt.Sprintf("%s already exists, maybe try adding a variation?", cocktail), nil, true)
 			return
 		}
 	}
@@ -234,40 +234,44 @@ func createProposal(ctx context.Context, client *storage.Client, s *discordgo.Se
 	dm(s, cowman, content)
 }
 
-func createVariation(s *discordgo.Session, i *discordgo.InteractionCreate) {
+func createVariation(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
 	var name *discordgo.ApplicationCommandInteractionDataOption
 	var ingredients *discordgo.ApplicationCommandInteractionDataOption
-	var instructions *discordgo.ApplicationCommandInteractionDataOption
-	var garnish *discordgo.ApplicationCommandInteractionDataOption
 	for _, opt := range i.ApplicationCommandData().Options[0].Options {
 		switch opt.Name {
 		case "name":
 			name = opt
 		case "ingredients":
 			ingredients = opt
-		case "instructions":
-			instructions = opt
-		case "garnish":
-			garnish = opt
 		}
 	}
 
-	g := "None"
-	if garnish != nil {
-		g = garnish.StringValue()
-	}
-	sp := &spec{
-		Name:         name.StringValue(),
-		Ingredients:  []variation{strings.Split(ingredients.StringValue(), ",")},
-		Instructions: strings.Split(instructions.StringValue(), ","),
-		Garnish:      g,
+	cocktails, err := listCocktails(ctx, client)
+	if err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
 	}
 
-	content := fmt.Sprintf("Spec waiting on approval, you can edit by running create again:\n%s", sp)
+	var found string
+	for _, cocktail := range cocktails {
+		if normalizeName(cocktail) == normalizeName(name.StringValue()) {
+			found = cocktail
+		}
+	}
+	if found == "" {
+		respond(s, i.Interaction, fmt.Sprintf("%s not found, can't propose variation", name.StringValue()), nil, true)
+	}
+
+	sp := &spec{
+		Name:        found,
+		Ingredients: []variation{strings.Split(ingredients.StringValue(), ",")},
+	}
+
+	content := fmt.Sprintf("Variation waiting on approval, you can edit by running 'create-variation' again:\n%s", sp)
 	if !respond(s, i.Interaction, content, nil, true) {
 		return
 	}
-	waitingCreates.add(normalizeName(name.StringValue()), sp)
+	waitingVariations.add(normalizeName(name.StringValue()), sp)
 
 	// DM Cowman
 	var user *discordgo.User
@@ -281,7 +285,7 @@ func createVariation(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if err == nil {
 		guildName = guild.Name
 	}
-	content = fmt.Sprintf("Spec submitted by %q in %q:\n%s", user.Username, guildName, sp)
+	content = fmt.Sprintf("Variation submitted by %q in %q:\n%s", user.Username, guildName, sp)
 	dm(s, cowman, content)
 }
 
@@ -331,6 +335,61 @@ func approveProposal(ctx context.Context, client *storage.Client, s *discordgo.S
 	waitingCreates.remove(normalizeName(name))
 }
 
+func approveVariation(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
+	var user *discordgo.User
+	if i.Member != nil {
+		user = i.Member.User
+	} else {
+		user = i.User
+	}
+	if user.ID != cowman {
+		respond(s, i.Interaction, "You're not my boss!", nil, true)
+		return
+	}
+
+	name := i.ApplicationCommandData().Options[0].Options[0].StringValue()
+	v, ok := waitingVariations.get(normalizeName(name))
+	if !ok {
+		respond(s, i.Interaction, fmt.Sprintf("%q not found", name), nil, true)
+		return
+	}
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Flags: 1 << 6,
+		},
+	}); err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+
+	cur, err := getSpec(ctx, client, v.Name)
+	if err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+
+	// We just take the ingredients from the proposed variation.
+	cur.Ingredients = append(cur.Ingredients, v.Ingredients...)
+
+	data, err := json.Marshal(cur)
+	if err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+	if err := createCocktail(ctx, client, cur.Name, data); err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+	if _, err := s.InteractionResponseEdit(s.State.User.ID, i.Interaction, &discordgo.WebhookEdit{
+		Content: fmt.Sprintf("%q approved and updated.", cur.Name),
+	}); err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+	waitingCreates.remove(normalizeName(name))
+}
+
 func denyProposal(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
 	var user *discordgo.User
 	if i.Member != nil {
@@ -353,9 +412,41 @@ func denyProposal(ctx context.Context, client *storage.Client, s *discordgo.Sess
 	respond(s, i.Interaction, fmt.Sprintf("%q denied", name), nil, true)
 }
 
+func denyVariation(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
+	var user *discordgo.User
+	if i.Member != nil {
+		user = i.Member.User
+	} else {
+		user = i.User
+	}
+	if user.ID != cowman {
+		respond(s, i.Interaction, "You're not my boss!", nil, true)
+		return
+	}
+
+	name := i.ApplicationCommandData().Options[0].Options[0].StringValue()
+	_, ok := waitingVariations.get(normalizeName(name))
+	if !ok {
+		respond(s, i.Interaction, fmt.Sprintf("%q not found", name), nil, true)
+		return
+	}
+	waitingVariations.remove(normalizeName(name))
+	respond(s, i.Interaction, fmt.Sprintf("%q denied", name), nil, true)
+}
+
 func listProposals(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	waitingList := waitingCreates.list()
-	content := fmt.Sprintf("%d proposals\n\n", len(waitingList))
+	content := fmt.Sprintf("%d proposals pending\n\n", len(waitingList))
+	for _, p := range waitingList {
+		content = fmt.Sprintf("%s%s\n\n", content, p)
+	}
+
+	respond(s, i.Interaction, content, nil, true)
+}
+
+func listVariations(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	waitingList := waitingVariations.list()
+	content := fmt.Sprintf("%d variations pending\n\n", len(waitingList))
 	for _, p := range waitingList {
 		content = fmt.Sprintf("%s%s\n\n", content, p)
 	}
@@ -380,14 +471,20 @@ func baseHandler(ctx context.Context, client *storage.Client, s *discordgo.Sessi
 		switch i.ApplicationCommandData().Options[0].Name {
 		case "create":
 			createProposal(ctx, client, s, i)
-		case "add-variation":
-			createVariation(s, i)
+		case "create-variation":
+			createVariation(ctx, client, s, i)
 		case "list":
 			listProposals(s, i)
+		case "list-variations":
+			listVariations(s, i)
 		case "deny":
 			denyProposal(ctx, client, s, i)
+		case "deny-variation":
+			denyVariation(ctx, client, s, i)
 		case "approve":
 			approveProposal(ctx, client, s, i)
+		case "approve-variation":
+			approveVariation(ctx, client, s, i)
 		}
 	}
 }

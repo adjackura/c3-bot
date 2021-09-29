@@ -112,7 +112,7 @@ var (
 					},
 				},
 				{
-					Name:        "add-variation",
+					Name:        "create-variation",
 					Description: "propose a variation on an existing spec",
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 					Options: []*discordgo.ApplicationCommandOption{
@@ -144,6 +144,19 @@ var (
 					},
 				},
 				{
+					Name:        "approve-variation",
+					Description: "approve a proposed variation",
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Options: []*discordgo.ApplicationCommandOption{
+						{
+							Type:        discordgo.ApplicationCommandOptionString,
+							Name:        "name",
+							Description: "name of the proposal",
+							Required:    true,
+						},
+					},
+				},
+				{
 					Name:        "deny",
 					Description: "deny a proposed spec",
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
@@ -157,8 +170,26 @@ var (
 					},
 				},
 				{
+					Name:        "deny-variation",
+					Description: "deny a proposed variation",
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Options: []*discordgo.ApplicationCommandOption{
+						{
+							Type:        discordgo.ApplicationCommandOptionString,
+							Name:        "name",
+							Description: "name of the proposal",
+							Required:    true,
+						},
+					},
+				},
+				{
 					Name:        "list",
 					Description: "list the current proposals",
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+				},
+				{
+					Name:        "list-variations",
+					Description: "list the current variation proposals",
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 				},
 			},
