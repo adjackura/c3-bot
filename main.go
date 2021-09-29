@@ -26,12 +26,14 @@ import (
 var (
 	token  = flag.String("token", "", "discord bot token")
 	bucket = flag.String("bucket", "", "gcs bucket to use")
+
+	approvedUser = "780258092042551376"
 )
 
 var (
 	commands = []*discordgo.ApplicationCommand{
 		{
-			Name:        "c3-cocktail",
+			Name:        "c3",
 			Description: "Cowman's cocktail commands",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
@@ -40,15 +42,21 @@ var (
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 				},
 				{
-					Name:        "picture",
+					Name:        "search",
 					Description: "show a random picture for this cocktail",
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 					Options: []*discordgo.ApplicationCommandOption{
 						{
 							Type:        discordgo.ApplicationCommandOptionString,
 							Name:        "name",
-							Description: "name of the cocktail",
-							Required:    true,
+							Description: "name of the cocktail to show, mutually exclusive with other options",
+							Required:    false,
+						},
+						{
+							Type:        discordgo.ApplicationCommandOptionString,
+							Name:        "ingredients",
+							Description: "comma seperated list of ingredients to search by",
+							Required:    false,
 						},
 					},
 				},
@@ -101,19 +109,6 @@ var (
 					Description: "list the current proposals",
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 				},
-				{
-					Name:        "ingredients",
-					Description: "random cocktail with specific ingredients",
-					Type:        discordgo.ApplicationCommandOptionSubCommand,
-					Options: []*discordgo.ApplicationCommandOption{
-						{
-							Type:        discordgo.ApplicationCommandOptionString,
-							Name:        "ingredients",
-							Description: "comma seperated list of ingredients to search by",
-							Required:    true,
-						},
-					},
-				},
 			},
 		},
 	}
@@ -121,129 +116,223 @@ var (
 
 var waitingApproval = map[string]string{}
 
-func cocktail(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
-	var content string
-	var files []*discordgo.File
-	switch i.ApplicationCommandData().Options[0].Name {
-	case "random":
-		spec, pic, closer, err := randomCocktail(ctx, client)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-		content = string(spec)
-		if pic != nil {
-			defer closer()
-			files = []*discordgo.File{
-				pic,
-			}
-		}
-	case "picture":
-		prefix := i.ApplicationCommandData().Options[0].Options[0].StringValue()
-		pic, closer, err := randomPic(ctx, client, strings.ToLower(prefix))
-		if err != nil {
-			log.Print(err)
-			return
-		}
-		if pic != nil {
-			content = fmt.Sprintf("Here is a %q:", prefix)
-			defer closer()
-			files = []*discordgo.File{
-				pic,
-			}
-		} else {
-			content = fmt.Sprintf("Sorry, I don't have any pictures for a %q.", prefix)
-		}
-	case "propose":
-		name := i.ApplicationCommandData().Options[0].Options[0].StringValue()
-		ingredients := i.ApplicationCommandData().Options[0].Options[1].StringValue()
-		instructions := i.ApplicationCommandData().Options[0].Options[2].StringValue()
-		garnish := "None"
-		if len(i.ApplicationCommandData().Options[0].Options) > 3 {
-			garnish = i.ApplicationCommandData().Options[0].Options[3].StringValue()
-		}
+func logInteractionError(s *discordgo.Session, i *discordgo.Interaction, err error) {
+	s.FollowupMessageCreate(s.State.User.ID, i, true, &discordgo.WebhookParams{
+		Content: "Something went wrong",
+	})
+	log.Print(err)
+}
 
-		sp := &spec{
-			name:         name,
-			ingredients:  strings.Split(ingredients, ","),
-			instructions: strings.Split(instructions, ","),
-			garnish:      garnish,
-		}
-		out := sp.marshal()
-		content := fmt.Sprintf("Spec waiting on approval, you can edit by running create again:\n%s", out)
-		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: content,
-			},
-		}); err != nil {
-			log.Print(err)
-			return
-		}
-		waitingApproval[name] = out
-	case "approve":
-		name := i.ApplicationCommandData().Options[0].Options[0].StringValue()
-		data, ok := waitingApproval[name]
-		if !ok {
-			if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{
-					Content: fmt.Sprintf("%q not found", name),
-				},
-			}); err != nil {
-				log.Print(err)
-				return
-			}
-		}
-		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-		}); err != nil {
-			log.Print(err)
-			return
-		}
-		if err := createCocktail(ctx, client, name, data); err != nil {
-			log.Print(err)
-			s.FollowupMessageCreate(s.State.User.ID, i.Interaction, true, &discordgo.WebhookParams{
-				Content: "Something went wrong",
-			})
-			return
-		}
-		if _, err := s.InteractionResponseEdit(s.State.User.ID, i.Interaction, &discordgo.WebhookEdit{
-			Content: fmt.Sprintf("%q approved and uploaded.", name),
-		}); err != nil {
-			log.Print(err)
-			return
-		}
-		delete(waitingApproval, name)
-	case "list-proposals":
-		content := fmt.Sprintf("%d proposals\n\n", len(waitingApproval))
-		for _, p := range waitingApproval {
-			content = fmt.Sprintf("%s%s\n\n", content, p)
-		}
-
-		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: content,
-			},
-		}); err != nil {
-			log.Print(err)
-			return
-		}
-
-	case "ingredients":
-		content = "I don't know how to do this yet"
-		if len(i.ApplicationCommandData().Options[0].Options) >= 1 {
-			content = fmt.Sprintf("%s with ingredients %q", content, strings.Split(i.ApplicationCommandData().Options[0].Options[0].StringValue(), ","))
-		}
-	}
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+func respond(s *discordgo.Session, i *discordgo.Interaction, content string, files []*discordgo.File) bool {
+	if err := s.InteractionRespond(i, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: content,
 			Files:   files,
 		},
-	})
+	}); err != nil {
+		logInteractionError(s, i, err)
+		return false
+	}
+	return true
+}
+
+func random(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
+	var files []*discordgo.File
+	spec, pic, closer, err := randomCocktail(ctx, client)
+	if err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+	content := string(spec)
+	if pic != nil {
+		defer closer()
+		files = []*discordgo.File{
+			pic,
+		}
+	}
+	respond(s, i.Interaction, content, files)
+}
+
+func search(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if len(i.ApplicationCommandData().Options[0].Options) == 0 {
+		respond(s, i.Interaction, "Must provide a search option.", nil)
+		return
+	}
+
+	var name *discordgo.ApplicationCommandInteractionDataOption
+	var ingredients *discordgo.ApplicationCommandInteractionDataOption
+	for _, opt := range i.ApplicationCommandData().Options[0].Options {
+		switch opt.Name {
+		case "name":
+			name = opt
+		case "ingredients":
+			ingredients = opt
+		}
+	}
+	if name != nil && ingredients != nil {
+		respond(s, i.Interaction, "Must provide only one search option.", nil)
+		return
+	}
+
+	if name != nil {
+		cocktails, err := listCocktails(ctx, client)
+		if err != nil {
+			logInteractionError(s, i.Interaction, err)
+			return
+		}
+
+		for _, cocktail := range cocktails {
+			if cocktail == normalizeName(name.StringValue()) {
+				var files []*discordgo.File
+				spec, pic, closer, err := getCocktail(ctx, client, cocktail)
+				if err != nil {
+					logInteractionError(s, i.Interaction, err)
+					return
+				}
+				content := string(spec)
+				if pic != nil {
+					defer closer()
+					files = []*discordgo.File{
+						pic,
+					}
+				}
+				respond(s, i.Interaction, content, files)
+				return
+			}
+		}
+		// If we got here that means that the name is not an exact match, try doing prefix matches.
+		var matches string
+		for _, cocktail := range cocktails {
+			if strings.HasPrefix(cocktail, normalizeName(name.StringValue())) {
+				matches = fmt.Sprintf("%s%s\n", matches, cocktail)
+			}
+		}
+
+		if matches == "" {
+			respond(s, i.Interaction, fmt.Sprintf("No matches, for %q", normalizeName(name.StringValue())), nil)
+			return
+		}
+		respond(s, i.Interaction, "No exact matches, here are some partial matches:\n"+matches, nil)
+		return
+	}
+
+	if ingredients != nil {
+		content := "I don't know how to do this yet"
+		if len(i.ApplicationCommandData().Options[0].Options) >= 1 {
+			content = fmt.Sprintf("%s with ingredients %q", content, strings.Split(ingredients.StringValue(), ","))
+		}
+		respond(s, i.Interaction, content, nil)
+	}
+}
+
+func propose(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	var name *discordgo.ApplicationCommandInteractionDataOption
+	var ingredients *discordgo.ApplicationCommandInteractionDataOption
+	var instructions *discordgo.ApplicationCommandInteractionDataOption
+	var garnish *discordgo.ApplicationCommandInteractionDataOption
+	for _, opt := range i.ApplicationCommandData().Options[0].Options {
+		switch opt.Name {
+		case "name":
+			name = opt
+		case "ingredients":
+			ingredients = opt
+		case "instructions":
+			instructions = opt
+		case "garnish":
+			garnish = opt
+		}
+	}
+
+	g := "None"
+	if garnish != nil {
+		g = garnish.StringValue()
+	}
+	sp := &spec{
+		name:         name.StringValue(),
+		ingredients:  strings.Split(ingredients.StringValue(), ","),
+		instructions: strings.Split(instructions.StringValue(), ","),
+		garnish:      g,
+	}
+	out := sp.marshal()
+	content := fmt.Sprintf("Spec waiting on approval, you can edit by running create again:\n%s", out)
+	if !respond(s, i.Interaction, content, nil) {
+		return
+	}
+	waitingApproval[name.StringValue()] = out
+}
+
+func approve(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Member != nil {
+		if i.Member.User.ID != approvedUser {
+			respond(s, i.Interaction, "You're not my boss!", nil)
+		}
+	}
+	if i.User != nil {
+		if i.User.ID != approvedUser {
+			respond(s, i.Interaction, "You're not my boss!", nil)
+		}
+	}
+	name := i.ApplicationCommandData().Options[0].Options[0].StringValue()
+	data, ok := waitingApproval[name]
+	if !ok {
+		if !respond(s, i.Interaction, fmt.Sprintf("%q not found", name), nil) {
+			return
+		}
+	}
+	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	}); err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+	if err := createCocktail(ctx, client, name, data); err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+	if _, err := s.InteractionResponseEdit(s.State.User.ID, i.Interaction, &discordgo.WebhookEdit{
+		Content: fmt.Sprintf("%q approved and uploaded.", name),
+	}); err != nil {
+		logInteractionError(s, i.Interaction, err)
+		return
+	}
+	delete(waitingApproval, name)
+}
+
+func listProposals(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Member != nil {
+		if i.Member.User.ID != approvedUser {
+			respond(s, i.Interaction, "You're not my boss!", nil)
+		}
+	}
+	if i.User != nil {
+		if i.User.ID != approvedUser {
+			respond(s, i.Interaction, "You're not my boss!", nil)
+		}
+	}
+	content := fmt.Sprintf("%d proposals\n\n", len(waitingApproval))
+	for _, p := range waitingApproval {
+		content = fmt.Sprintf("%s%s\n\n", content, p)
+	}
+
+	if !respond(s, i.Interaction, content, nil) {
+		return
+	}
+}
+
+func baseHandler(ctx context.Context, client *storage.Client, s *discordgo.Session, i *discordgo.InteractionCreate) {
+	switch i.ApplicationCommandData().Options[0].Name {
+	case "random":
+		random(ctx, client, s, i)
+	case "search":
+		search(ctx, client, s, i)
+	case "propose":
+		propose(s, i)
+	case "approve":
+		approve(ctx, client, s, i)
+	case "list-proposals":
+		listProposals(s, i)
+	}
 }
 
 func createCocktail(ctx context.Context, client *storage.Client, name, data string) error {
@@ -279,7 +368,7 @@ func (s *spec) marshal() string {
 	}
 	ingredients = strings.TrimSpace(ingredients)
 	return fmt.Sprintf(
-		"%s%s\n\n%s\n%s\n\n%s%s\n\n%s\n%s", namePrefix, s.name, ingredientsPrefix, ingredients, garnishPrefix, s.garnish, instructionsPrefix, s.instructions)
+		"%s%s\n\n%s\n%s\n\n%s%s\n\n%s\n%s", namePrefix, s.name, ingredientsPrefix, ingredients, garnishPrefix, s.garnish, instructionsPrefix, instructions)
 }
 
 func parseSpec(raw []byte) spec {
@@ -321,13 +410,13 @@ func listCocktails(ctx context.Context, client *storage.Client) ([]string, error
 		if err != nil {
 			return nil, err
 		}
-		cocktails = append(cocktails, attrs.Prefix)
+		cocktails = append(cocktails, strings.TrimSuffix(attrs.Prefix, "/"))
 	}
 	return cocktails, nil
 }
 
 func getSpec(ctx context.Context, client *storage.Client, prefix string) ([]byte, error) {
-	reader, err := client.Bucket(*bucket).Object(prefix + "spec").NewReader(ctx)
+	reader, err := client.Bucket(*bucket).Object(path.Join(prefix, "spec")).NewReader(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -380,22 +469,25 @@ func randomPic(ctx context.Context, client *storage.Client, prefix string) (*dis
 	return &sFile, reader.Close, nil
 }
 
+func getCocktail(ctx context.Context, client *storage.Client, cocktail string) ([]byte, *discordgo.File, func() error, error) {
+	data, err := getSpec(ctx, client, cocktail)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	f, closer, err := randomPic(ctx, client, cocktail)
+	return data, f, closer, err
+}
+
 func randomCocktail(ctx context.Context, client *storage.Client) ([]byte, *discordgo.File, func() error, error) {
 	cocktails, err := listCocktails(ctx, client)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	fmt.Println(cocktails)
 	rand.Seed(time.Now().UnixNano())
 	prefix := cocktails[rand.Intn(len(cocktails))]
 	fmt.Println("prefix:", prefix)
-	data, err := getSpec(ctx, client, prefix)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	f, closer, err := randomPic(ctx, client, prefix)
-	return data, f, closer, err
+	return getCocktail(ctx, client, prefix)
 }
 
 func main() {
@@ -414,7 +506,7 @@ func main() {
 
 	// Start handlers.
 	s.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		cocktail(ctx, gcsClient, s, i)
+		baseHandler(ctx, gcsClient, s, i)
 	})
 	s.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
 		messageCreate(ctx, gcsClient, s, m)
