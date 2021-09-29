@@ -51,7 +51,7 @@ var (
 						{
 							Type:        discordgo.ApplicationCommandOptionString,
 							Name:        "name",
-							Description: "name of the cocktail to search for, if no exact match is found prefix search will be used",
+							Description: "name of the cocktail to search for",
 							Required:    true,
 						},
 					},

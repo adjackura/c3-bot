@@ -36,6 +36,7 @@ func search(ctx context.Context, client *storage.Client, s *discordgo.Session, i
 		return
 	}
 
+	// Find exact matches first
 	for _, cocktail := range cocktails {
 		if normalizeName(cocktail) == normalizeName(name) {
 			var files []*discordgo.File
@@ -54,10 +55,10 @@ func search(ctx context.Context, client *storage.Client, s *discordgo.Session, i
 			return
 		}
 	}
-	// If we got here that means that the name is not an exact match, try doing prefix matches.
+	// If we got here that means that the name is not an exact match, try partial matches
 	var matches []string
 	for _, cocktail := range cocktails {
-		if strings.HasPrefix(normalizeName(cocktail), normalizeName(name)) {
+		if strings.Contains(normalizeName(cocktail), normalizeName(name)) {
 			matches = append(matches, cocktail)
 		}
 	}
